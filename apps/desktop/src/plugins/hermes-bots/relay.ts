@@ -43,6 +43,132 @@ const RELAY_DRAIN_INTERVAL_MS = 30_000
 // backends (and connections whose events don't reach the tap).
 const RELAY_PUSH_DEBOUNCE_MS = 250
 
+// ── roster publisher identity ─────────────────────────────────────────────
+// Several Desktops (and several windows of one Desktop) hold sockets to the
+// same gateway and each pushes ITS OWN view of the peer set, while the gateway
+// keeps ONE roster. Two views that knew different peer sets therefore erased
+// each other every tick: the SH gateway flapped n=17 ↔ n=15 once a minute and
+// the rows only the larger view knew vanished for 8–16 s at a time.
+//
+// Every push now names its publisher — `<install_id>:<window>`, e.g.
+// `0096c20b30dc42f3:win-1` — so the gateway keeps one shard per pushing window
+// and serves their union (tools/bot_relay.py, roster/publishers/). The install
+// segment is the backend install this Desktop runs on: the same token the
+// gateway merges rows by, so shards of one machine never multiply identities.
+// A gateway that predates the contract ignores the param and keeps the old
+// replace semantics, so the push never fails over it.
+const RELAY_INSTALL_KEY = 'hermes.desktop.botRelay.install.v1'
+const RELAY_INSTALL_RE = /^[A-Za-z0-9_-]{8,80}$/
+/** Install id per connection, learned from `profiles.list` (the roster loop's own read). */
+const relayInstallsByConnection = new Map<string, string>()
+let relayInstallSegment: null | string = null
+let relayWindowSegment: null | string = null
+
+function mintHex(bytes: number): string {
+  const buffer = new Uint8Array(bytes)
+
+  if (typeof globalThis.crypto?.getRandomValues === 'function') {
+    globalThis.crypto.getRandomValues(buffer)
+  } else {
+    for (let i = 0; i < buffer.length; i += 1) {
+      buffer[i] = Math.floor(Math.random() * 256)
+    }
+  }
+
+  return [...buffer].map(byte => byte.toString(16).padStart(2, '0')).join('')
+}
+
+/** This window's segment. One renderer run = one window, so a fresh id per run
+ *  is the whole point: two windows of one Desktop must never share a shard, or
+ *  they are back to overwriting each other. A closed window's shard ages out
+ *  (TTL), so a throwaway id costs nothing. */
+function relayWindowId(): string {
+  relayWindowSegment ??= `win-${mintHex(2)}`
+
+  return relayWindowSegment
+}
+
+/** Persisted fallback install segment for a Desktop whose backend has not
+ *  answered `profiles.list` yet (remote-only inventory, first tick, an older
+ *  backend that reports no install_id). Stable per install so a restart reuses
+ *  its shard instead of leaving a ghost one behind. */
+function relayFallbackInstallId(): string {
+  if (relayInstallSegment !== null) {
+    return relayInstallSegment
+  }
+
+  try {
+    const stored = globalThis.localStorage?.getItem(RELAY_INSTALL_KEY)?.trim()
+
+    if (stored && RELAY_INSTALL_RE.test(stored)) {
+      relayInstallSegment = stored
+
+      return relayInstallSegment
+    }
+
+    relayInstallSegment = `desktop-${mintHex(8)}`
+    globalThis.localStorage?.setItem(RELAY_INSTALL_KEY, relayInstallSegment)
+  } catch {
+    // Storage blocked (sandbox/private mode): scope this run only.
+    relayInstallSegment = `desktop-${mintHex(8)}`
+  }
+
+  return relayInstallSegment
+}
+
+/** Remember a connection's backend identity; only a well-formed id is used. */
+function rememberRelayInstall(connectionId: string, installId: string | undefined) {
+  const id = String(installId || '').trim()
+
+  if (connectionId && RELAY_INSTALL_RE.test(id)) {
+    relayInstallsByConnection.set(connectionId, id)
+  }
+}
+
+/** This Desktop's install segment: the local route's backend first (that IS
+ *  the install the app runs on), then a primary route, then any route we have
+ *  seen, then the persisted fallback. A learned id is written through to the
+ *  persisted slot so a restart (and a sole-connection clear, which never reads
+ *  `profiles.list`) keeps publishing under the same shard. */
+function relayInstallFor(connections: RelayConnection[]): string {
+  const preferred =
+    connections.find(connection => connection.route.mode === 'local') ||
+    connections.find(connection => connection.route.primary === true)
+
+  const learned = (install: string): string => {
+    try {
+      if (globalThis.localStorage?.getItem(RELAY_INSTALL_KEY) !== install) {
+        globalThis.localStorage?.setItem(RELAY_INSTALL_KEY, install)
+      }
+    } catch {
+      // Storage blocked — the learned id still holds for this run.
+    }
+
+    return install
+  }
+
+  const seen = preferred ? relayInstallsByConnection.get(preferred.id) : undefined
+
+  if (seen) {
+    return learned(seen)
+  }
+
+  for (const connection of connections) {
+    const install = relayInstallsByConnection.get(connection.id)
+
+    if (install) {
+      return learned(install)
+    }
+  }
+
+  return relayFallbackInstallId()
+}
+
+/** This window's publisher id: `<install_id>:<window>`. */
+function relayPublisherId(connections: RelayConnection[]): string {
+  return `${relayInstallFor(connections)}:${relayWindowId()}`
+}
+
 /** Everything the two loops mutate. */
 interface RelayLifecycle {
   disposed: boolean
@@ -143,6 +269,12 @@ interface RelayAgentRow {
   handle: string
   profile: string
   title: string
+  /** Backend install identity (`profiles.list` → `/api/status` `install_id`) of
+   *  the connection this agent lives on. Two connections that report the same
+   *  id are ONE machine reached over two routes, so the gateway merges their
+   *  rows and keeps the spare ids as aliases. Absent for older backends — the
+   *  gateway then keeps a per-connection row, exactly as before. */
+  install_id?: string
 }
 
 /** Remove the mandatory local registry source only when Electron identifies
@@ -337,6 +469,9 @@ async function relayAgentsOn(
     // This connection's default is @hermes only while it has no real 'hermes' profile.
     const hermesTaken = profiles.some(profile => profile?.name === 'hermes')
     const label = labels.get(connection.id) || connection.id
+    const installId = String(res?.install_id || '').trim()
+
+    rememberRelayInstall(connection.id, installId)
 
     const rows = profiles
       .map(profile => ({
@@ -348,11 +483,14 @@ async function relayAgentsOn(
         connection_id: connection.id,
         connection_label: label,
         title: String(profile?.ui_meta?.['hermes-bots']?.title || profile?.display_name || ''),
-        description: String(profile?.description || '')
+        description: String(profile?.description || ''),
+        // The backend's own identity, so the receiving gateway can tell that this
+        // connection and another one are the SAME machine (no id → no collapse).
+        ...(RELAY_INSTALL_RE.test(installId) ? { install_id: installId } : {})
       }))
       .filter(row => row.profile)
 
-    host.traceIdentityChange?.('bot-relay', `rows ${connection.id}`, rosterTrace(rows, String(res?.install_id || '')))
+    host.traceIdentityChange?.('bot-relay', `rows ${connection.id}`, rosterTrace(rows, installId))
 
     return rows
   } catch {
@@ -434,7 +572,12 @@ async function syncRelayRosters() {
             }
 
             try {
-              await host.requestProfile(connection.route, 'bot_relay.roster.sync', { agents: [] })
+              // The clear carries this window's publisher too: it may only forget
+              // ITS OWN shard, never the other windows' views of the peer set.
+              await host.requestProfile(connection.route, 'bot_relay.roster.sync', {
+                agents: [],
+                publisher: relayPublisherId(connections)
+              })
 
               return true
             } catch {
@@ -511,7 +654,11 @@ async function syncRelayRosters() {
 
         try {
           await host.requestProfile(connection.route, 'bot_relay.roster.sync', {
-            agents: others
+            agents: others,
+            // Names this window so the gateway keeps ITS shard of the roster: two
+            // Desktops/windows pushing different views serve their union instead of
+            // overwriting each other (an older gateway ignores the param).
+            publisher: relayPublisherId(connections)
           })
         } catch {
           // Older backend without the relay RPCs — skip this connection.

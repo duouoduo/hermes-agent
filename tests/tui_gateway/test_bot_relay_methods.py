@@ -50,6 +50,82 @@ def test_roster_sync_persists_and_counts(home):
     assert [r["profile"] for r in bot_relay.read_remote_roster(home)] == ["scout"]
 
 
+def _capture_logs():
+    """Collect every log line emitted while a handler call runs.
+
+    The handlers are rebound onto ``tui_gateway.server``'s globals, so their logger is that
+    module's — attach at the root and pin its level so INFO lines are seen regardless of the
+    session's logging setup (the suite points the root logger at a file handler).
+    """
+    import contextlib
+    import logging
+
+    lines: list[str] = []
+    handler = logging.Handler()
+    handler.setLevel(0)
+    handler.emit = lambda record: lines.append(record.getMessage())
+    root = logging.getLogger()
+    previous = root.level
+
+    @contextlib.contextmanager
+    def _scope():
+        root.addHandler(handler)
+        root.setLevel(0)
+        try:
+            yield lines
+        finally:
+            root.removeHandler(handler)
+            root.setLevel(previous)
+
+    return _scope()
+
+
+def test_roster_sync_scopes_each_publisher_and_logs_who_pushed(home):
+    """``publisher`` rides through to the shard writer, so two windows publishing the same install
+    over two routes serve ONE merged row. The changed-roster line names the window that pushed —
+    and an alias-only push logs nothing, because the roster a client sees did not change."""
+    studio = "0096c20b30dc42f3"
+    lan = {"profile": "default", "handle": "hermes", "connection_id": "100-90-126-123-9119",
+           "install_id": studio, "title": "Studio"}
+    via_sh = {"profile": "default", "handle": "hermes", "connection_id": "mac-studio-via-sh",
+              "install_id": studio, "title": "Studio"}
+    researcher = {"profile": "researcher", "handle": "researcher", "connection_id": "mac-studio-via-sh",
+                  "install_id": studio, "title": "Researcher"}
+
+    with _capture_logs() as lines:
+        _result(srv._methods["bot_relay.roster.sync"](1, {"agents": [lan], "publisher": f"{studio}:win-1"}))
+        # Second window sees the SAME machine over another route: only an alias is added.
+        _result(srv._methods["bot_relay.roster.sync"](2, {"agents": [via_sh], "publisher": f"{studio}:win-2"}))
+        # Now the view really changes (a profile only this window knows) — its shard still reports
+        # the machine it already knew, just over its own route.
+        _result(srv._methods["bot_relay.roster.sync"](
+            3, {"agents": [via_sh, researcher], "publisher": f"{studio}:win-2"}))
+
+    roster = bot_relay.read_remote_roster(home)
+    default_row = next(row for row in roster if row["profile"] == "default")
+
+    assert len(roster) == 2, roster
+    assert default_row["aliases"] == ["mac-studio-via-sh"]
+    changed = [line for line in lines if "roster changed" in line]
+    assert len(changed) == 2, changed  # alias-only push is silent — nothing for a client to redraw
+    assert f"[publisher={studio}:win-1]" in changed[0], changed
+    assert f"[publisher={studio}:win-2]" in changed[1], changed
+
+
+def test_roster_sync_without_publisher_stays_on_the_legacy_path(home):
+    """An older Desktop sends no ``publisher``: the handler must keep replacing the single
+    roster.json (and say so in the log) — the pre-contract behaviour, untouched."""
+    with _capture_logs() as lines:
+        _result(srv._methods["bot_relay.roster.sync"](
+            1, {"agents": [{"profile": "scout", "handle": "scout", "connection_id": "cloud-1"}]}))
+
+    base = bot_relay.relay_root(home)
+
+    assert (base / bot_relay.ROSTER_FILE).is_file()
+    assert not (base / bot_relay.PUBLISHERS_DIR).exists()
+    assert any("[publisher=legacy]" in line for line in lines), lines
+
+
 def test_outbox_drain_replays_canonical_envelope_until_reply_acknowledged(home):
     """A drained envelope is not "delivered" — its stable id is replayed on every
     drain until the target's terminal reply is written under that id, so a

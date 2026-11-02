@@ -519,7 +519,9 @@ method("groups.peer.register", params=GroupsPeerRegisterParams, result=GroupsPee
 
 class RelayAgentRow(Params):
     """A roster row the Desktop pushes (``tools/bot_relay.py::_normalize_roster_row``); invalid
-    rows are dropped server-side, so the shape stays open."""
+    rows are dropped server-side, so the shape stays open. ``install_id`` is the backend identity
+    (``/api/status``) of the connection the agent lives on: two rows sharing it are one machine
+    reached over two routes, and the gateway merges them."""
 
     profile: str | None = None
     handle: str | None = None
@@ -528,11 +530,16 @@ class RelayAgentRow(Params):
     title: str | None = None
     description: str | None = None
     online: bool | None = None
+    install_id: str | None = None
     model_config = Params.model_config | {"extra": "allow"}
 
 
 class BotRelayRosterSyncParams(ProfileParams):
     agents: list[RelayAgentRow] | None = None
+    # ``<install_id>:<window>`` — the pushing Desktop window. It owns ONE roster shard, so several
+    # windows publishing different views serve their union instead of overwriting each other.
+    # Absent (older Desktop) → the pre-contract whole-file replace.
+    publisher: str | None = None
 
 
 class BotRelayRosterSyncResult(Result):
@@ -540,7 +547,8 @@ class BotRelayRosterSyncResult(Result):
 
 
 method("bot_relay.roster.sync", params=BotRelayRosterSyncParams, result=BotRelayRosterSyncResult,
-       doc="Replace this gateway's view of agents on other connections; answers the accepted row count.")
+       doc="Merge this Desktop window's view of agents on other connections into its publisher shard; "
+           "answers the accepted row count.")
 
 
 class BotRelayOutboxDrainParams(ProfileParams):

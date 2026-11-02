@@ -384,11 +384,11 @@ describe('relay-route socket retention (#93594)', () => {
     // route, since each profile home holds its own roster; the local source is never polled.
     // Two profiles of one connection are not peers: no profiles.list, nothing pinned.
     expect(calls).toEqual([
-      { connectionId: 'remote-primary', method: 'bot_relay.roster.sync', params: { agents: [] }, route: route('remote-primary', { primary: true }) },
+      { connectionId: 'remote-primary', method: 'bot_relay.roster.sync', params: { agents: [], publisher: expect.any(String) }, route: route('remote-primary', { primary: true }) },
       {
         connectionId: 'remote-primary',
         method: 'bot_relay.roster.sync',
-        params: { agents: [] },
+        params: { agents: [], publisher: expect.any(String) },
         route: route('remote-primary', { primary: true, profile: 'research' })
       }
     ])
@@ -807,7 +807,7 @@ describe('the roster loop pushes the OTHER connections’ agents', () => {
     await vi.advanceTimersByTimeAsync(0)
 
     expect(calls).toEqual([
-      expect.objectContaining({ connectionId: 'a', method: 'bot_relay.roster.sync', params: { agents: [] } })
+      expect.objectContaining({ connectionId: 'a', method: 'bot_relay.roster.sync', params: { agents: [], publisher: expect.any(String) } })
     ])
 
     await vi.advanceTimersByTimeAsync(60_000)
@@ -830,7 +830,7 @@ describe('the roster loop pushes the OTHER connections’ agents', () => {
     hostMock.profileRoutes = vi.fn(async () => [route('a')])
     await vi.advanceTimersByTimeAsync(60_000)
     expect(calls).toEqual([
-      expect.objectContaining({ connectionId: 'a', method: 'bot_relay.roster.sync', params: { agents: [] } })
+      expect.objectContaining({ connectionId: 'a', method: 'bot_relay.roster.sync', params: { agents: [], publisher: expect.any(String) } })
     ])
 
     stopBotRelay()
@@ -1166,7 +1166,7 @@ describe('the roster loop forgets a machine that left', () => {
     await vi.advanceTimersByTimeAsync(60_000)
 
     const syncs = calls.filter(call => call.method === 'bot_relay.roster.sync')
-    expect(syncs).toEqual([expect.objectContaining({ connectionId: 'a', params: { agents: [] } })])
+    expect(syncs).toEqual([expect.objectContaining({ connectionId: 'a', params: { agents: [], publisher: expect.any(String) } })])
 
     // Once, not on every tick.
     calls.length = 0
@@ -1219,7 +1219,7 @@ describe('the roster loop forgets a machine that left', () => {
     clearFails = false
     await vi.advanceTimersByTimeAsync(60_000)
     expect(calls.filter(call => call.method === 'bot_relay.roster.sync')).toEqual([
-      expect.objectContaining({ connectionId: 'a', params: { agents: [] } })
+      expect.objectContaining({ connectionId: 'a', params: { agents: [], publisher: expect.any(String) } })
     ])
 
     // And once it lands it is spent, exactly as before.

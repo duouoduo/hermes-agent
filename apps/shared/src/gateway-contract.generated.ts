@@ -1850,8 +1850,9 @@ export interface GroupsPeerRegisterResult {
 export interface BotRelayRosterSyncParams {
   profile?: string | null
   agents?: RelayAgentRow[] | null
+  publisher?: string | null
 }
-/** A roster row the Desktop pushes (``tools/bot_relay.py::_normalize_roster_row``); invalid rows are dropped server-side, so the shape stays open. */
+/** A roster row the Desktop pushes (``tools/bot_relay.py::_normalize_roster_row``); invalid rows are dropped server-side, so the shape stays open. ``install_id`` is the backend identity (``/api/status``) of the connection the agent lives on: two rows sharing it are one machine reached over two routes, and the gateway merges them. */
 export interface RelayAgentRow {
   profile?: string | null
   handle?: string | null
@@ -1860,6 +1861,7 @@ export interface RelayAgentRow {
   title?: string | null
   description?: string | null
   online?: boolean | null
+  install_id?: string | null
   [key: string]: unknown
 }
 export interface BotRelayRosterSyncResult {
@@ -6063,7 +6065,7 @@ export interface RpcMethods {
   'bot_relay.outbox.drain': { params: BotRelayOutboxDrainParams; result: BotRelayOutboxDrainResult }
   /** Write a relayed reply and/or typed error for an envelope so the sender-side waiter resolves. */
   'bot_relay.reply': { params: BotRelayReplyParams; result: OkResult }
-  /** Replace this gateway's view of agents on other connections; answers the accepted row count. */
+  /** Merge this Desktop window's view of agents on other connections into its publisher shard; answers the accepted row count. */
   'bot_relay.roster.sync': { params: BotRelayRosterSyncParams; result: BotRelayRosterSyncResult }
   /** Inspect, attach to, or drop the CDP browser the tools use; ``messages`` narrate a connect. */
   'browser.manage': { params: BrowserManageParams; result: BrowserManageResult }

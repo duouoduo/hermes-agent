@@ -242,7 +242,7 @@
     },
     {
       "name": "bot_relay.roster.sync",
-      "summary": "Replace this gateway's view of agents on other connections; answers the accepted row count.",
+      "summary": "Merge this Desktop window's view of agents on other connections into its publisher shard; answers the accepted row count.",
       "params": [
         {
           "name": "params",
@@ -7467,6 +7467,18 @@
             ],
             "default": null,
             "title": "Agents"
+          },
+          "publisher": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Publisher"
           }
         },
         "title": "BotRelayRosterSyncParams",
@@ -32742,7 +32754,7 @@
       },
       "RelayAgentRow": {
         "additionalProperties": true,
-        "description": "A roster row the Desktop pushes (``tools/bot_relay.py::_normalize_roster_row``); invalid\nrows are dropped server-side, so the shape stays open.",
+        "description": "A roster row the Desktop pushes (``tools/bot_relay.py::_normalize_roster_row``); invalid\nrows are dropped server-side, so the shape stays open. ``install_id`` is the backend identity\n(``/api/status``) of the connection the agent lives on: two rows sharing it are one machine\nreached over two routes, and the gateway merges them.",
         "properties": {
           "profile": {
             "anyOf": [
@@ -32827,6 +32839,18 @@
             ],
             "default": null,
             "title": "Online"
+          },
+          "install_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Install Id"
           }
         },
         "title": "RelayAgentRow",

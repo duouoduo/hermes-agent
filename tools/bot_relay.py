@@ -14,6 +14,7 @@ when the target is definitively offline (fail fast instead of queueing a DM nobo
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -33,10 +34,26 @@ logger = logging.getLogger(__name__)
 
 RELAY_DIR_NAME = "bot_relay"
 ROSTER_FILE = "roster.json"
+# Per-publisher roster shards live here: `roster/publishers/<publisher>.json`. The legacy single
+# `roster.json` stays alongside them as one more source (see `write_remote_roster`).
+PUBLISHERS_DIR = "publishers"
 OUTBOX_DIR = "outbox"
 CLAIMED_DIR = "claimed"
 REPLIES_DIR = "replies"
 LOCKS_DIR = "locks"
+
+# A publisher shard is only trusted while it is fresh. The Desktop re-pushes its roster every 60 s
+# (RELAY_ROSTER_INTERVAL_MS), so 90 s tolerates one skipped tick and a reconnect while a window that
+# was closed mid-push ages out instead of pinning its rows forever.
+DEFAULT_PUBLISHER_TTL_SECONDS = 90
+# Rows written before the publisher contract (and by callers that never name themselves) live here.
+LEGACY_PUBLISHER = "legacy"
+# A publisher names itself `<install_id>:<window>`. What arrives is untrusted RPC input, and the id
+# becomes a file name, so it is validated, then slugged (a colon is illegal on Windows) plus
+# short-hashed so two ids can never share a shard.
+_PUBLISHER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+# Backend install identity from `/api/status` (also the Desktop's row collapse key).
+_INSTALL_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,80}$")
 
 # Config fallbacks (real knobs: ``bot_mode.turn_wait_seconds`` / ``bot_mode.envelope_ttl_seconds``).
 TURN_WAIT_SECONDS_FALLBACK = 120
@@ -131,32 +148,200 @@ def _normalize_roster_row(row: Any) -> Optional[dict]:
     # Liveness kept only when a real bool: absent == unknown == fail-open on enqueue.
     if isinstance(row.get("online"), bool):
         out["online"] = row["online"]
+    # Backend install identity: the SAME install reached over two routes (hostname and Tailscale
+    # address, say) is one bot, not two. An absent id is the pre-contract case (no collapse); a
+    # malformed one is dropped rather than failing the row — a bad annotation must never cost a
+    # live teammate its routing entry, exactly like an older backend that sends no id at all.
+    install_id = str(row.get("install_id") or "").strip()
+    if install_id and _INSTALL_ID_RE.match(install_id):
+        out["install_id"] = install_id
     return out
 
 
-def write_remote_roster(root: Path | str, rows: Any) -> int:
-    """Atomically persist the Desktop-pushed remote roster. Returns count."""
+def _publisher_key(publisher: Any) -> Optional[str]:
+    """Validated publisher id, or None for a caller that does not name itself (legacy path)."""
+    if not isinstance(publisher, str):
+        return None
+    key = publisher.strip()
+    return key if key and _PUBLISHER_RE.match(key) else None
+
+
+def _publisher_shard_path(base: Path, publisher: str) -> Path:
+    """`<relay>/publishers/<slug>-<hash>.json`: readable, and unique per publisher id."""
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "-", publisher).strip("-")[:48] or "p"
+    return base / PUBLISHERS_DIR / f"{slug}-{hashlib.sha1(publisher.encode('utf-8')).hexdigest()[:8]}.json"
+
+
+def _publisher_ttl_seconds() -> int:
+    """Configured shard TTL (``bot_mode.roster_publisher_ttl_seconds``); 0 disables expiry."""
+    val = _bot_mode_cfg("roster_publisher_ttl_seconds", loader="load_config_readonly")
+    if val is None:
+        return DEFAULT_PUBLISHER_TTL_SECONDS
+    try:
+        return max(0, int(val))
+    except (TypeError, ValueError, OverflowError):
+        logger.debug("Invalid bot_mode.roster_publisher_ttl_seconds %r; using fallback", val)
+        return DEFAULT_PUBLISHER_TTL_SECONDS
+
+
+def _roster_payload(path: Path) -> Optional[dict]:
+    """One roster file's parsed payload, or None when absent/unreadable/not an object."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return None
+    except Exception:
+        logger.debug("bot_relay roster read failed: %s", path, exc_info=True)
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _payload_rows(payload: Optional[dict]) -> list[dict]:
+    agents = payload.get("agents") if isinstance(payload, dict) else None
+    return [r for r in map(_normalize_roster_row, agents) if r] if isinstance(agents, list) else []
+
+
+def _payload_written_at(payload: Optional[dict], path: Path) -> Optional[float]:
+    """When a roster file was last written: its ``updated_at``, else the file's own mtime."""
+    try:
+        return float((payload or {}).get("updated_at") or path.stat().st_mtime)
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def roster_updated_at(root: Path | str) -> Optional[float]:
+    """Newest write across every roster source (legacy file + publisher shards), or None when no
+    roster exists yet. Callers use this to decide whether a roster is fresh enough to trust."""
+    base = relay_root(root)
+    stamps: list[float] = []
+    for path in [base / ROSTER_FILE, *sorted((base / PUBLISHERS_DIR).glob("*.json"))]:
+        with contextlib.suppress(OSError):
+            stamps.append(path.stat().st_mtime)
+    return max(stamps) if stamps else None
+
+
+def _prune_expired_shards(base: Path, *, now: float, ttl: float, keep: Optional[Path] = None) -> None:
+    """Drop shards nobody will read again (a closed window's last push). Best effort."""
+    if ttl <= 0:
+        return
+    for path in sorted((base / PUBLISHERS_DIR).glob("*.json")):
+        if keep is not None and path == keep:
+            continue
+        payload = _roster_payload(path)
+        written = _payload_written_at(payload, path)
+        if written is not None and now - written > ttl:
+            with contextlib.suppress(OSError):
+                path.unlink()
+
+
+def _merge_roster_rows(rows: list[dict]) -> list[dict]:
+    """One row per backend identity: `(install_id or connection_id, profile)`.
+
+    Two connections that reach the SAME install are one bot with several routes, so a group keeps
+    ONE canonical `connection_id` for routing and lists the rest under `aliases` — dropping them
+    would lose the route a Desktop happens to be holding. The canonical pick is the id the most
+    sources can route to, ties broken lexicographically: a choice that flipped between two equally
+    represented routes would look like a brand-new row to every client and re-broadcast the roster.
+    """
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for row in rows:
+        key = (row.get("install_id") or f"conn:{row['connection_id']}", row["profile"])
+        groups.setdefault(key, []).append(row)
+
+    merged: list[dict] = []
+    for key in sorted(groups):
+        group = groups[key]
+        claims: dict[str, int] = {}
+        for row in group:
+            claims[row["connection_id"]] = claims.get(row["connection_id"], 0) + 1
+        canonical_id = min(claims, key=lambda cid: (-claims[cid], cid))
+        # One representative per connection id; the richest (titled/labelled) one wins so the row a
+        # client renders keeps its human name when only one source knows it. The serialised content
+        # is the final tie-break: the pick must not depend on the order shards happened to load in,
+        # or the same roster could render as a change and re-broadcast on every push.
+        candidates = [row for row in group if row["connection_id"] == canonical_id]
+        best = max(candidates, key=lambda row: (
+            bool(row.get("title")), bool(row.get("connection_label")), bool(row.get("description")),
+            json.dumps(row, sort_keys=True)))
+        out = dict(best)
+        aliases = sorted({row["connection_id"] for row in group} - {canonical_id})
+        if aliases:
+            out["aliases"] = aliases
+        merged.append(out)
+
+    return sorted(merged, key=lambda row: (row["connection_id"], row["profile"]))
+
+
+def _read_roster_sources(root: Path | str, *, now: Optional[float] = None,
+                         ttl_seconds: Optional[float] = None) -> list[dict]:
+    """Every row from every LIVE roster source — unmerged. The legacy single file is read whole (its
+    freshness is the caller's business, as before); a publisher shard older than the TTL is skipped
+    so a window that stopped publishing cannot pin its view of the world forever."""
+    base = relay_root(root)
+    ttl = _publisher_ttl_seconds() if ttl_seconds is None else ttl_seconds
+    stamp = time.time() if now is None else now
+    rows: list[dict] = list(_payload_rows(_roster_payload(base / ROSTER_FILE)))
+    for path in sorted((base / PUBLISHERS_DIR).glob("*.json")):
+        payload = _roster_payload(path)
+        if payload is None:
+            continue
+        written = _payload_written_at(payload, path)
+        if ttl > 0 and written is not None and stamp - written > ttl:
+            continue
+        rows.extend(_payload_rows(payload))
+    return rows
+
+
+def write_remote_roster(root: Path | str, rows: Any, *, publisher: Any = None) -> int:
+    """Persist one publisher's view of the remote roster; returns how many rows it accepted.
+
+    A caller that names itself (``publisher``: the Desktop's ``<install_id>:<window>``) owns ONE
+    shard under ``publishers/`` and can only ever replace that shard, so two Desktops — or two
+    windows, or the same machine reached over two routes — pushing different views no longer erase
+    each other; ``read_remote_roster`` serves their union. A caller with no publisher keeps the
+    pre-contract path byte for byte: the single ``roster.json``, replaced whole.
+    """
     base = _ensure_dirs(root)
     by_key: dict[tuple[str, str], dict] = {}
     for norm in filter(None, map(_normalize_roster_row, rows if isinstance(rows, list) else [])):
         by_key.setdefault((norm["connection_id"], norm["profile"]), norm)
     cleaned = [by_key[k] for k in sorted(by_key)]
-    _atomic_write_json(base / ROSTER_FILE, {"updated_at": int(time.time()), "agents": cleaned}, sort_keys=True)
+    payload: dict[str, Any] = {"updated_at": int(time.time()), "agents": cleaned}
+    key = _publisher_key(publisher)
+    if key is None:
+        _atomic_write_json(base / ROSTER_FILE, payload, sort_keys=True)
+    else:
+        payload["publisher"] = key
+        path = _publisher_shard_path(base, key)
+        from hermes_constants import mkdir_under_hermes_home
+        mkdir_under_hermes_home(path.parent)
+        _atomic_write_json(path, payload, sort_keys=True)
+        _prune_expired_shards(base, now=time.time(), ttl=_publisher_ttl_seconds(), keep=path)
     return len(cleaned)
 
 
-def read_remote_roster(root: Path | str) -> list[dict]:
-    """The current remote roster (possibly empty). Never raises."""
+def read_remote_roster(root: Path | str, *, now: Optional[float] = None,
+                       ttl_seconds: Optional[float] = None) -> list[dict]:
+    """The current remote roster (possibly empty), merged per backend identity. Never raises.
+
+    Union of the legacy file and every unexpired publisher shard, collapsed so one install's profile
+    is one row: ``connection_id`` stays the routable key and the other routes ride along as
+    ``aliases``.
+    """
     try:
-        raw = (relay_root(root) / ROSTER_FILE).read_text(encoding="utf-8-sig")
-        data = json.loads(raw)
-        agents = data.get("agents") if isinstance(data, dict) else None
-        return [r for r in map(_normalize_roster_row, agents) if r] if isinstance(agents, list) else []
-    except FileNotFoundError:
-        return []
+        return _merge_roster_rows(_read_roster_sources(root, now=now, ttl_seconds=ttl_seconds))
     except Exception:
         logger.debug("bot_relay roster read failed", exc_info=True)
         return []
+
+
+def _row_connection_ids(row: dict) -> list[str]:
+    """Every connection id that can route to a row: its canonical id, then its aliases."""
+    ids = [row["connection_id"]]
+    aliases = row.get("aliases")
+    if isinstance(aliases, list):
+        ids.extend(str(alias) for alias in aliases if str(alias) and str(alias) != row["connection_id"])
+    return ids
 
 
 def _target_ids(row: dict) -> set[str]:
@@ -175,12 +360,15 @@ def resolve_remote_target(raw_target: str, roster: list[dict]) -> Any:
     """Matched row for a bare handle/profile/title slug (unique across connections) or
     ``<handle|profile|title-slug>@<connection-id>``; ``"ambiguous"`` for a bare form on several
     connections; None otherwise. An exact handle/profile match beats a title slug, so a title
-    colliding with another row's handle never steals it."""
+    colliding with another row's handle never steals it. A merged row answers to every routing id it
+    carries — its canonical ``connection_id`` and each alias — so a target still resolves whichever
+    of an install's routes the caller happened to hear about."""
     want, at, conn = (p.strip() for p in str(raw_target or "").strip().lstrip("@").partition("@"))
     if not want or (at and not conn):
         return None
     want = want.lower()
-    rows = [row for row in roster if not conn or row["connection_id"].lower() == conn.lower()]
+    rows = [row for row in roster
+            if not conn or conn.lower() in {cid.lower() for cid in _row_connection_ids(row)}]
     matches = [row for row in rows if want in _target_ids(row)] or [row for row in rows if want in _target_aliases(row)]
     if not matches:
         return None
@@ -234,7 +422,10 @@ def qualify_sender_stamp(message: str, from_handle: Any, from_connection: Any, r
     match = _SENDER_STAMP_RE.match(str(message or ""))
     if not match or not conn or not _HANDLE_RE.match(handle) or not _HANDLE_RE.match(conn):
         return message
-    forms = dict(zip(((r["connection_id"].lower(), r["handle"].lower()) for r in roster), remote_target_forms(roster, local_taken)))
+    forms: dict[tuple[str, str], str] = {}
+    for row, form in zip(roster, remote_target_forms(roster, local_taken)):
+        for cid in _row_connection_ids(row):
+            forms.setdefault((cid.lower(), row["handle"].lower()), form)
     form = forms.get((conn.lower(), handle.lower())) or f"{handle}@{conn}"
     return f"{match.group(1)}{form}{match.group(3)}{message[match.end():]}"
 
@@ -255,17 +446,22 @@ def _envelope_ttl_seconds() -> int:
 def _target_liveness(root: Path | str, target: dict) -> Optional[bool]:
     """Tri-state liveness: True / False / None (unknown → callers fail open). Offline =
     explicit ``online: false`` or ABSENT from a *fresh* roster; a missing, unreadable,
-    empty or stale roster proves nothing → None. Never raises."""
+    empty or stale roster proves nothing → None. Never raises.
+
+    Freshness spans every roster source (legacy file AND publisher shards), and the lookup accepts
+    any routing id a merged row carries, so a target named by an install's second route is not read
+    as "vanished" merely because that route lost the canonical pick."""
     try:
-        try:
-            age = time.time() - (relay_root(root) / ROSTER_FILE).stat().st_mtime
-        except OSError:
+        updated = roster_updated_at(root)
+        if updated is None:
             return None
-        roster = read_remote_roster(root) if age <= ROSTER_FRESH_SECONDS else []
+        roster = read_remote_roster(root) if time.time() - updated <= ROSTER_FRESH_SECONDS else []
         if not roster:
             return None
-        key = (str(target.get("connection_id") or ""), str(target.get("profile") or ""))
-        row = next((r for r in roster if (r["connection_id"], r["profile"]) == key), None)
+        connection_id = str(target.get("connection_id") or "")
+        profile = str(target.get("profile") or "")
+        row = next((r for r in roster
+                    if r["profile"] == profile and connection_id in _row_connection_ids(r)), None)
         if row is None:
             return False  # fresh roster no longer lists the target — offline
         return row["online"] if isinstance(row.get("online"), bool) else None
@@ -442,7 +638,7 @@ def write_reply(root: Path | str, envelope_id: str, *, reply: str = "", error: s
 
 def _sweep_stale(base: Path, *, now: float | None = None) -> int:
     return sum(unlink_files_older_than(base / sub, "*.json", STALE_AFTER_SECONDS, now=now)
-               for sub in (CLAIMED_DIR, REPLIES_DIR, OUTBOX_DIR))
+               for sub in (CLAIMED_DIR, REPLIES_DIR, OUTBOX_DIR, PUBLISHERS_DIR))
 
 
 def cleanup_bot_relay_artifacts(max_age_hours: float | None = None) -> int:

@@ -30,13 +30,19 @@ TURN_MAX_ATTEMPTS = 2  # first admission + the owner's one transient-failure ret
 
 @method("bot_relay.roster.sync")
 def _(rid, params: dict, _root=_relay_root) -> dict:
-    """Replace this gateway's view of agents on OTHER connections → ``{count}`` accepted rows
-    (``agents`` rows ``{profile, handle, connection_id, ...}``; invalid rows are dropped).
-    A roster that changes is logged with its rows: a peer connection listed with this machine's
-    own profiles, or two publishers alternating, shows up as a flapping line (the pushing window
-    is in the Desktop's desktop.log ``[bot-relay win=…]`` lines at the same time)."""
+    """Merge this Desktop window's view of agents on OTHER connections → ``{count}`` accepted rows
+    (``agents`` rows ``{profile, handle, connection_id, install_id?}``; invalid rows are dropped).
+
+    ``publisher`` = the pushing window's ``<install_id>:<window>``: it owns ONE shard of the roster,
+    so several Desktops (or windows) pushing different views serve their union instead of erasing
+    each other. A caller that sends no publisher keeps the pre-contract whole-file replace.
+    A roster that changes is logged with its rows AND the publishing window, so two publishers
+    alternating is visible in one line (the same window is in the Desktop's desktop.log
+    ``[bot-relay win=…]`` lines at the same time)."""
     try:
         from tools.bot_relay import read_remote_roster, write_remote_roster
+
+        publisher = str(params.get("publisher") or "").strip()
 
         def trace() -> str:
             rows = read_remote_roster(_root())
@@ -44,10 +50,12 @@ def _(rid, params: dict, _root=_relay_root) -> dict:
                 f"{r.get('connection_id')}/{r.get('profile')}={r.get('title')!r}" for r in rows) + "]"
 
         before = trace()
-        count = write_remote_roster(_root(), params.get("agents"))
+        count = write_remote_roster(_root(), params.get("agents"), publisher=publisher or None)
         after = trace()
         if after != before:
-            logging.getLogger(__name__).info("bot_relay roster changed: %s -> %s", before, after)
+            logging.getLogger(__name__).info(
+                "bot_relay roster changed [publisher=%s]: %s -> %s",
+                publisher or "legacy", before, after)
         return _ok(rid, {"count": count})
     except Exception as e:
         return _err(rid, 5090, str(e))
